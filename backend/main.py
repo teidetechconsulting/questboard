@@ -1,6 +1,9 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-import json, os, threading, time, uuid
+import json, os
+# Second line on purpose: upstream edits the import above, and keeping these
+# separate stops `git merge upstream/main` from conflicting on it.
+import threading, time, uuid
 
 app = FastAPI()
 
@@ -14,13 +17,6 @@ app.add_middleware(
 _DATA_DIR   = os.environ.get("QUESTBOARD_DATA", "/data")
 STATE_FILE  = os.path.join(_DATA_DIR, "state.json")
 CONFIG_FILE = os.path.join(_DATA_DIR, "config.json")
-
-# The browser clients POST whole documents and race each other (last write
-# wins). The /api/* endpoints below are called by Home Assistant, which has no
-# local copy of state to merge, so they must read-modify-write server-side.
-# This lock only serialises those; it deliberately does not touch the
-# frontend's own POST /state path, so no frontend change is needed.
-_LOCK = threading.Lock()
 
 
 def read_json(path):
@@ -39,14 +35,6 @@ def write_json(path, data):
     with open(tmp, "w") as f:
         json.dump(data, f)
     os.replace(tmp, path)
-
-
-def mutate(path, fn):
-    with _LOCK:
-        data = read_json(path) or {}
-        result = fn(data)
-        write_json(path, data)
-        return result
 
 
 @app.get("/state")
@@ -90,13 +78,44 @@ async def post_config(request: Request):
 # Home Assistant calls http://host:8099/api/bounty and it arrives as /bounty.
 # Registering these as "/api/bounty" would only be reachable at /api/api/bounty.
 
+# The browser clients POST whole documents and race each other (last write
+# wins). The /api/* endpoints below are called by Home Assistant, which has no
+# local copy of state to merge, so they must read-modify-write server-side.
+# This lock only serialises those; it deliberately does not wrap POST /state.
+_LOCK = threading.Lock()
+
+
+def mutate(path, fn):
+    with _LOCK:
+        data = read_json(path) or {}
+        result = fn(data)
+        write_json(path, data)
+        return result
+
+
+def known_players():
+    """id -> name, from config. Empty until the setup wizard has run."""
+    return {p.get("id"): p.get("name") for p in (read_json(CONFIG_FILE) or {}).get("players") or []}
+
+
+async def read_body(request):
+    # Home Assistant hand-builds this JSON in a template, so an empty payload or
+    # an unescaped quote in a chore title is a live failure mode. Unguarded,
+    # request.json() raises and Starlette answers 500 -- the one error path that
+    # would not match the {"ok": false} shape the caller parses.
+    try:
+        body = await request.json()
+    except Exception:
+        return None
+    return body if isinstance(body, dict) else None
+
 
 @app.post("/bounty")
 async def api_bounty(request: Request):
     """Append a bounty. createdBy is left null so the house funds it and every
     player can claim it — see BountyBoard.jsx isCreator/canClaim."""
-    body = await request.json()
-    if not isinstance(body, dict):
+    body = await read_body(request)
+    if body is None:
         return {"ok": False, "error": "invalid"}
 
     title = str(body.get("title") or "").strip()
@@ -112,13 +131,18 @@ async def api_bounty(request: Request):
 
     icon = str(body.get("icon") or "🔧")
     assigned_to = body.get("assignedTo") or None
+    if assigned_to is not None:
+        assigned_to = str(assigned_to)
+        # An assignee the frontend cannot match is unrecoverable: canClaim fails
+        # for everyone, and createdBy is null so nobody sees a cancel button.
+        if assigned_to not in known_players():
+            return {"ok": False, "error": "unknown assignedTo"}
     dedupe_key = body.get("dedupeKey") or None
 
     def apply(state):
         bounties = state.get("bounties") or []
         # Match completed bounties too. Otherwise a kid can scan, claim, and
-        # rescan the same tag for unlimited house-funded gold. The key carries
-        # the date, so this is one post per tag per day.
+        # rescan the same tag for unlimited house-funded gold.
         if dedupe_key and any(b.get("dedupeKey") == dedupe_key for b in bounties):
             return {"ok": True, "deduped": True}
 
@@ -155,8 +179,8 @@ async def api_bounty(request: Request):
 async def api_grant(request: Request):
     """Mint gold for a player, so large cash-backed garden bounties can be
     funded without grinding chores first."""
-    body = await request.json()
-    if not isinstance(body, dict):
+    body = await read_body(request)
+    if body is None:
         return {"ok": False, "error": "invalid"}
 
     player_id = str(body.get("playerId") or "").strip()
@@ -169,14 +193,28 @@ async def api_grant(request: Request):
     if gold == 0:
         return {"ok": False, "error": "gold must be non-zero"}
 
-    known = {p.get("id") for p in (read_json(CONFIG_FILE) or {}).get("players") or []}
-    if known and player_id not in known:
+    players = known_players()
+    if players and player_id not in players:
         return {"ok": False, "error": "unknown playerId"}
+    reason = str(body.get("reason") or "bonus").strip()[:48]
 
     def apply(state):
         current = (state.get("gold") or {}).get(player_id, 0)
         new_total = max(0, current + gold)
+        delta = new_total - current
         state["gold"] = {**(state.get("gold") or {}), player_id: new_total}
+        # HistoryTab renders 'loot' as "found (+Ng)" and 'penalty' as
+        # "attacked by (-Ng)", so this needs no frontend change. Log the
+        # realised delta, not the requested one -- new_total is clamped at 0.
+        if delta:
+            state["history"] = (state.get("history") or []) + [{
+                "type": "loot" if delta > 0 else "penalty",
+                "player": players.get(player_id) or player_id,
+                "playerId": player_id,
+                "name": reason,
+                "pts": abs(delta),
+                "ts": int(time.time() * 1000),
+            }]
         return {"ok": True, "playerId": player_id, "gold": new_total}
 
     return mutate(STATE_FILE, apply)
@@ -187,8 +225,8 @@ async def api_vacation(request: Request):
     """Toggle away-mode. With enabled=true and no dates, isVacationDay() covers
     every day, so the overnight monster penalty never fires and kill streaks
     freeze instead of resetting."""
-    body = await request.json()
-    if not isinstance(body, dict):
+    body = await read_body(request)
+    if body is None:
         return {"ok": False, "error": "invalid"}
 
     # GET /config only reports needs_setup when the file is absent, so writing a

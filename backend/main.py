@@ -83,9 +83,15 @@ async def post_config(request: Request):
 # ── Home Assistant integration ────────────────────────────────────────────────
 # Additive endpoints only. Nothing below is called by the frontend, so upstream
 # merges stay conflict-free as long as edits stay under this banner.
+#
+# Paths are bare, exactly like /state and /config above. nginx proxies
+# `location /api/` to `http://127.0.0.1:5050/` and the trailing slash strips the
+# prefix, which is why the SPA's fetch('/api/state') lands on /state here.
+# Home Assistant calls http://host:8099/api/bounty and it arrives as /bounty.
+# Registering these as "/api/bounty" would only be reachable at /api/api/bounty.
 
 
-@app.post("/api/bounty")
+@app.post("/bounty")
 async def api_bounty(request: Request):
     """Append a bounty. createdBy is left null so the house funds it and every
     player can claim it — see BountyBoard.jsx isCreator/canClaim."""
@@ -110,12 +116,10 @@ async def api_bounty(request: Request):
 
     def apply(state):
         bounties = state.get("bounties") or []
-        # An NFC tag tapped twice, or a kid tapping it again because nothing
-        # visibly happened, must not post the same quest twice.
-        if dedupe_key and any(
-            b.get("dedupeKey") == dedupe_key and not b.get("completedAt")
-            for b in bounties
-        ):
+        # Match completed bounties too. Otherwise a kid can scan, claim, and
+        # rescan the same tag for unlimited house-funded gold. The key carries
+        # the date, so this is one post per tag per day.
+        if dedupe_key and any(b.get("dedupeKey") == dedupe_key for b in bounties):
             return {"ok": True, "deduped": True}
 
         now = int(time.time() * 1000)
@@ -147,7 +151,7 @@ async def api_bounty(request: Request):
     return mutate(STATE_FILE, apply)
 
 
-@app.post("/api/grant")
+@app.post("/grant")
 async def api_grant(request: Request):
     """Mint gold for a player, so large cash-backed garden bounties can be
     funded without grinding chores first."""
@@ -165,6 +169,10 @@ async def api_grant(request: Request):
     if gold == 0:
         return {"ok": False, "error": "gold must be non-zero"}
 
+    known = {p.get("id") for p in (read_json(CONFIG_FILE) or {}).get("players") or []}
+    if known and player_id not in known:
+        return {"ok": False, "error": "unknown playerId"}
+
     def apply(state):
         current = (state.get("gold") or {}).get(player_id, 0)
         new_total = max(0, current + gold)
@@ -174,7 +182,7 @@ async def api_grant(request: Request):
     return mutate(STATE_FILE, apply)
 
 
-@app.post("/api/vacation")
+@app.post("/vacation")
 async def api_vacation(request: Request):
     """Toggle away-mode. With enabled=true and no dates, isVacationDay() covers
     every day, so the overnight monster penalty never fires and kill streaks
@@ -182,7 +190,22 @@ async def api_vacation(request: Request):
     body = await request.json()
     if not isinstance(body, dict):
         return {"ok": False, "error": "invalid"}
-    enabled = bool(body.get("enabled"))
+
+    # GET /config only reports needs_setup when the file is absent, so writing a
+    # vacation-only config makes the frontend skip the wizard and then crash on
+    # cfg.players. mutate() always writes, so this has to short-circuit above it.
+    if not (read_json(CONFIG_FILE) or {}).get("players"):
+        return {"ok": False, "error": "not set up"}
+
+    raw = body.get("enabled")
+    if isinstance(raw, bool):
+        enabled = raw
+    elif isinstance(raw, str) and raw.strip().lower() in ("true", "false"):
+        enabled = raw.strip().lower() == "true"
+    else:
+        # Guessing here inverts away-mode, which drains gold nightly and looks
+        # like nothing happened. Better to fail the call.
+        return {"ok": False, "error": "enabled must be a boolean"}
 
     def apply(config):
         vacation = dict(config.get("vacation") or {})
@@ -195,7 +218,7 @@ async def api_vacation(request: Request):
     return mutate(CONFIG_FILE, apply)
 
 
-@app.get("/api/summary")
+@app.get("/summary")
 def api_summary():
     """Small aggregate for Home Assistant to poll. state.json grows without
     bound (history is never trimmed upstream), so HA must never fetch /state."""
@@ -208,14 +231,14 @@ def api_summary():
     bounties = state.get("bounties") or []
     history = state.get("history") or []
 
-    chores_this_week = {}
+    chores_logged = {}
     rewards_redeemed = {}
     for entry in history:
         pid = entry.get("playerId")
         if not pid:
             continue
         if entry.get("type") == "chore":
-            chores_this_week[pid] = chores_this_week.get(pid, 0) + 1
+            chores_logged[pid] = chores_logged.get(pid, 0) + 1
         elif entry.get("type") == "reward":
             rewards_redeemed[pid] = rewards_redeemed.get(pid, 0) + 1
 
@@ -227,7 +250,7 @@ def api_summary():
                 "mode": p.get("mode"),
                 "gold": gold.get(p.get("id"), 0),
                 "weeklyGold": weekly_gold.get(p.get("id"), 0),
-                "choresLogged": chores_this_week.get(p.get("id"), 0),
+                "choresLogged": chores_logged.get(p.get("id"), 0),
                 "rewardsRedeemed": rewards_redeemed.get(p.get("id"), 0),
             }
             for p in players
